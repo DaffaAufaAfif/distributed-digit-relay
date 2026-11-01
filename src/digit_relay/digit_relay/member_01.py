@@ -1,4 +1,4 @@
-"""Member 01: draw glyph 1 on turns 1 and 4."""
+"""Member 01: draw 1 on its first turn and 10 at the start of cycle two."""
 
 from concurrent.futures import Future
 
@@ -36,6 +36,22 @@ VALID_TURNS = (MEMBER_ID, TOTAL_MEMBERS + MEMBER_ID)
 # One vertical stroke, normalized to the glyph box.
 GLYPH_1_STROKES = (
     ((0.5, 0.0), (0.5, 1.0)),
+)
+
+# Digit 10 fits in Member 01's slot: draw the 1 on the left and the 0 on the right.
+GLYPH_10_STROKES = (
+    ((0.16, 0.0), (0.16, 1.0)),
+    (
+        (0.53, 0.10),
+        (0.86, 0.10),
+        (0.96, 0.24),
+        (0.96, 0.76),
+        (0.86, 0.90),
+        (0.53, 0.90),
+        (0.43, 0.76),
+        (0.43, 0.24),
+        (0.53, 0.10),
+    ),
 )
 
 
@@ -227,7 +243,13 @@ class Member01(DigitDrawingMember):
         return result
 
     def draw_digit(self, number: int, slot: DigitSlot) -> Future:
-        """Draw Member 01's configured glyph 1 in its assigned slot."""
+        """Draw 1 on turn 1 and 10 on Member 01's cycle-two turn."""
+        if number == TOTAL_MEMBERS + MEMBER_ID:
+            self.glyph = '10'
+            self._normalized_strokes = GLYPH_10_STROKES
+        else:
+            self.glyph = '1'
+            self._normalized_strokes = GLYPH_1_STROKES
         return self._draw_configured_glyph(number, slot)
 
 

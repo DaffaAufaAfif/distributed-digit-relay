@@ -28,8 +28,10 @@ STATUS_QOS = QoSProfile(
 
 MEMBER_ID = 2
 TOTAL_MEMBERS = 9
-PEN_COLOR = (255, 105, 180)  # Pink 
-VALID_TURNS = (MEMBER_ID, TOTAL_MEMBERS + MEMBER_ID)
+FIRST_TURN = MEMBER_ID
+SECOND_TURN = TOTAL_MEMBERS + MEMBER_ID
+PEN_COLOR = (255, 105, 180)  # Pink (HotPink)
+VALID_TURNS = (FIRST_TURN, SECOND_TURN)
 
 # Single continuous stroke for digit '2', normalized to [0.0, 1.0] glyph box
 # where (0.0, 0.0) is bottom-left and (1.0, 1.0) is top-right.
@@ -43,6 +45,14 @@ GLYPH_2_STROKES = (
         (0.12, 0.00),
         (0.90, 0.00),
     ),
+)
+
+# Two parallel vertical strokes with slanted head for two-digit '11'
+GLYPH_11_STROKES = (
+    # Digit '1' pertama (kiri)
+    ((0.20, 0.80), (0.30, 1.00), (0.30, 0.00)),
+    # Digit '1' kedua (kanan)
+    ((0.60, 0.80), (0.70, 1.00), (0.70, 0.00)),
 )
 
 
@@ -197,7 +207,13 @@ class Member02(DigitDrawingMember):
         return result
 
     def draw_digit(self, number: int, slot: DigitSlot) -> Future:
-        """Draw Member 02's configured glyph 2 in its assigned slot."""
+        """Draw glyph 2 on the first turn and glyph 11 on the second turn."""
+        if number == FIRST_TURN:
+            self.glyph = '2'
+            self._normalized_strokes = GLYPH_2_STROKES
+        else:
+            self.glyph = '11'
+            self._normalized_strokes = GLYPH_11_STROKES
         return self._draw_configured_glyph(number, slot)
 
 
