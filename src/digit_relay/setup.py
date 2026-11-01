@@ -36,7 +36,7 @@ setup(
         'digit_relay_member_05 = digit_relay.member_05:main',
         'digit_relay_member_06 = digit_relay.member_06:main',
         'digit_relay_member_07 = digit_relay.member_07:main',
-        'digit_relay_member_08 = digit_relay.member_08:main',
+        ## 'digit_relay_member_08 = digit_relay.member_08:main',
         'digit_relay_member_09 = digit_relay.member_09:main',
         ],
     },
