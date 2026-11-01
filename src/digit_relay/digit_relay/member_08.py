@@ -25,12 +25,10 @@ STATUS_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE)
 
 MEMBER_ID = 8
 TOTAL_MEMBERS = 9
-PEN_COLOR = (255, 140, 0)  # Dark Orange
+PEN_COLOR = (128, 0, 0)
 FIRST_TURN = MEMBER_ID
 SECOND_TURN = TOTAL_MEMBERS + MEMBER_ID
 VALID_TURNS = (FIRST_TURN, SECOND_TURN)
-
-# Koordinat untuk angka "8" (continuous figure-eight stroke)
 GLYPH_8_STROKES = (
     (
         (0.50, 0.50),
@@ -51,7 +49,6 @@ GLYPH_8_STROKES = (
     ),
 )
 
-# Koordinat untuk angka "17" (stroke 1: digit 1, stroke 2: digit 7)
 GLYPH_17_STROKES = (
     # Digit '1' (kiri)
     ((0.08, 0.80), (0.18, 1.00), (0.18, 0.00)),
@@ -209,7 +206,6 @@ class Member08(DigitDrawingMember):
         return result
 
     def draw_digit(self, number: int, slot: DigitSlot) -> Future:
-        """Draw glyph 8 on the first turn and glyph 17 on the second turn."""
         if number == FIRST_TURN:
             self.glyph = '8'
             self._normalized_strokes = GLYPH_8_STROKES
