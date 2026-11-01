@@ -1,381 +1,972 @@
 # Distributed Digit Relay — Technical Documentation
 
-## 1. Project overview
+## Table of Contents
 
-Distributed Digit Relay is a ROS 2 Python package that coordinates independent
-member nodes to draw digits in turtlesim. Each member owns its topic callbacks,
-service clients, pen configuration, and glyph implementation. The abstract base
-class defines the required member interface and chains asynchronous service and
-drawing operations. A shared drawing controller is available for members that
-want pose-feedback motion without duplicating the low-level controller.
+1. [Project Overview](#1-project-overview)
+2. [Repository Layout](#2-repository-layout)
+3. [System Architecture](#3-system-architecture)
+4. [ROS Communication Layer](#4-ros-communication-layer)
+5. [Canvas and Slot System](#5-canvas-and-slot-system)
+6. [Class Hierarchy and Inheritance](#6-class-hierarchy-and-inheritance)
+7. [Module Reference](#7-module-reference)
+   - [digit_paths.py](#71-digit_pathspy)
+   - [relay_node.py](#72-relay_nodepy)
+   - [digit_drawing.py](#73-digit_drawingpy)
+   - [member_01.py through member_09.py](#74-member_01py-through-member_09py)
+   - [relay.launch.py](#75-relaylaunchpy)
+   - [setup.py and package.xml](#76-setuppy-and-packagexml)
+8. [Full Execution Flow](#8-full-execution-flow)
+9. [Turn Protocol State Machine](#9-turn-protocol-state-machine)
+10. [Drawing Engine Internals](#10-drawing-engine-internals)
+11. [Member Identity and Glyph Table](#11-member-identity-and-glyph-table)
+12. [Error Handling and Safety](#12-error-handling-and-safety)
+13. [Build and Run](#13-build-and-run)
+14. [Observability and Debugging](#14-observability-and-debugging)
 
-The repository currently contains a **single-member runnable example**:
+---
 
-1. Member 01 waits for its turn-topic subscription to be ready and publishes
-   token `[1, 1]`.
-2. Member 01 configures its pen and draws glyph `1` in slot 1.
-3. It publishes `[2, 1]` for the second cycle.
-4. Before drawing again, it calls `/clear`, lifts its pen, and draws glyph `1`.
-5. Member 01 shuts ROS down after turn 2; the launch event then closes
-   turtlesim.
+## 1. Project Overview
 
-`member_02.py` and `member_03.py` are intentionally absent. `member_xx.py` is a
-non-launched starter template for teammates. The running example uses
-`TOTAL_MEMBERS = 1`; the project must be integrated and configured consistently
-before additional members are launched.
+**Distributed Digit Relay** is a ROS 2 Python package that coordinates nine independent
+nodes—called *members*—to draw digits on a single shared turtlesim canvas in a strict,
+turn-based sequence.
 
-## 2. Repository layout
+The core idea is a **relay baton**: a turn token published on a shared ROS topic. Only the
+member that holds the token draws; all others wait and listen. When a member finishes
+drawing, it passes the token to the next member. This continues for two full cycles (18
+turns total), after which the system shuts down automatically.
+
+**Key design goals:**
+- Each member node is fully autonomous and owns its own ROS endpoints.
+- No shared memory, no direct calls between members—only ROS topic messages.
+- The drawing controller uses real-time pose feedback from turtlesim, not timed sleeps.
+- All asynchronous operations (service calls, drawing) return `concurrent.futures.Future`
+  objects and are chained with callbacks—the ROS event loop is never blocked.
+
+**What the relay draws:**
+
+| Cycle | Turn sequence | Each member draws |
+|---|---|---|
+| Cycle 1 | Turns 1–9 | Its own single-digit glyph (Member 01 → `1`, Member 02 → `2`, …, Member 09 → `9`) |
+| Cycle 2 | Turns 10–18 | Its own two-digit glyph (Member 01 → `10`, Member 02 → `11`, …, Member 09 → `18`) |
+
+Member 01 clears the turtlesim canvas at the start of cycle two (turn 10). Member 09
+handles the final turn (turn 18) and triggers ROS shutdown.
+
+---
+
+## 2. Repository Layout
 
 ```text
 distributed-digit-relay/
 ├── .gitignore
-├── README.md
+├── README.md                          ← Project summary and quick-start
 ├── doc/
-│   └── documentation.md
+│   └── documentation.md              ← This file
 └── src/
-    └── digit_relay/
-        ├── package.xml
-        ├── setup.py
-        ├── setup.cfg
-        ├── resource/digit_relay
-        ├── launch/relay.launch.py
-        └── digit_relay/
+    └── digit_relay/                   ← ROS 2 Python package root
+        ├── package.xml                ← ROS package metadata and dependencies
+        ├── setup.py                   ← Python package entry points and install rules
+        ├── setup.cfg                  ← setuptools configuration
+        ├── resource/
+        │   └── digit_relay            ← ament resource marker (required by ROS 2)
+        ├── launch/
+        │   └── relay.launch.py        ← Starts turtlesim + all 9 members; shuts on completion
+        └── digit_relay/               ← Python package (importable as `digit_relay`)
             ├── __init__.py
-            ├── relay_node.py
-            ├── digit_drawing.py
-            ├── digit_paths.py
-            ├── member_01.py
-            └── member_xx.py
+            ├── digit_paths.py         ← Canvas constants and slot allocation
+            ├── relay_node.py          ← Abstract base class and entry-point helper
+            ├── digit_drawing.py       ← Pose-feedback drawing controller
+            ├── member_01.py           ← Concrete member: draws 1 / 10
+            ├── member_02.py           ← Concrete member: draws 2 / 11
+            ├── member_03.py           ← Concrete member: draws 3 / 12
+            ├── member_04.py           ← Concrete member: draws 4 / 13
+            ├── member_05.py           ← Concrete member: draws 5 / 14
+            ├── member_06.py           ← Concrete member: draws 6 / 15
+            ├── member_07.py           ← Concrete member: draws 7 / 16
+            ├── member_08.py           ← Concrete member: draws 8 / 17
+            └── member_09.py           ← Concrete member: draws 9 / 18 (final)
 ```
+
+**File responsibilities at a glance:**
 
 | File | Responsibility |
 |---|---|
-| `relay_node.py` | Abstract node contract, shared identity/slot state, asynchronous hook sequencing, and spin/cleanup entry point. It creates no topics or service clients. |
-| `digit_drawing.py` | Reusable glyph-to-slot mapping and pose-feedback motion controller. Concrete member classes create the ROS publishers and subscriptions it uses. |
-| `digit_paths.py` | Canvas dimensions, grid constants, `DigitSlot`, and the `slot_for_member()` allocator. |
-| `member_01.py` | Runnable member implementation: own topic endpoints and service clients, turn state machine, glyph configuration, and startup/shutdown behavior. |
-| `member_xx.py` | Contributor template. Copy it to a uniquely named `member_NN.py`; do not launch the template as-is. |
-| `launch/relay.launch.py` | Starts turtlesim and the currently implemented Member 01, then shuts down the launch when that member exits. |
-| `setup.py` | Installs package metadata, launch files, and the `digit_relay_member_01` executable. |
-| `package.xml` | Declares ROS package metadata and runtime dependencies. |
-| `.gitignore` | Excludes ROS build products, Python caches, virtual environments, and common editor/OS files from Git. |
+| `digit_paths.py` | Canvas dimensions, 3×3 grid constants, `DigitSlot` type, and `slot_for_member()` allocator. Pure math, no ROS. |
+| `relay_node.py` | Abstract base class `DigitRelayNode`: stores member identity and slot, declares abstract hooks (`prepare_turn`, `set_pen`, `draw_digit`), implements `execute_turn()` Future chaining, and provides `run_member()` entry point. No ROS topics created here. |
+| `digit_drawing.py` | `DigitDrawingMember` subclass: stores pen color and normalized stroke paths; exposes `_draw_configured_glyph()`. Inner class `_DigitDrawingJob` runs the actual pose-feedback motion loop. |
+| `member_NN.py` | Concrete node: creates all ROS endpoints (publishers, subscribers, service clients), implements the turn state machine, and provides glyph stroke data. |
+| `relay.launch.py` | ROS 2 launch description: starts `turtlesim_node` and all nine member executables simultaneously; registers a shutdown event on Member 09 exit. |
+| `setup.py` | Registers nine console script entry points (one per member) and installs the launch file. |
 
-## 3. Execution model and communication
+---
 
-### Turn topic
+## 3. System Architecture
 
-Members coordinate on `/digit_relay/turn`, type
-`std_msgs/msg/Int32MultiArray`:
-
-```text
-data[0] = current_number
-data[1] = active_member
+```
+┌─────────────────────────────────────────────────────────┐
+│                    relay.launch.py                      │
+│  ┌──────────┐  ┌────────┐  ┌────────┐     ┌────────┐   │
+│  │turtlesim │  │member01│  │member02│ ... │member09│   │
+│  │  _node   │  │  node  │  │  node  │     │  node  │   │
+│  └──────────┘  └────────┘  └────────┘     └────────┘   │
+└─────────────────────────────────────────────────────────┘
+          │             │           │              │
+          │   /digit_relay/turn  (Int32MultiArray) │
+          │      ←────────────────────────────────→
+          │
+          │   /digit_relay/status (String)
+          │      ←────────────────────────────────
+          │
+          │   /turtle1/pose  (turtlesim/Pose)
+          │      ──────────→ (all members subscribe)
+          │
+          │   /turtle1/cmd_vel  (geometry_msgs/Twist)
+          │      ←──────────── (active member publishes)
+          │
+          │   /turtle1/set_pen  (turtlesim/SetPen service)
+          │      ←──────────── (active member calls)
+          │
+          │   /clear  (std_srvs/Empty service)
+          │      ←──────────── (Member 01 calls at turn 10)
 ```
 
-For example, `[2, 1]` means the second number/turn is assigned to Member 01.
-Each concrete member is expected to create its own publisher and subscriber.
-The topic uses reliable, volatile QoS with depth 1. Volatile durability prevents
-multiple publishers from replaying their individual stale tokens to a late
-subscriber. In a multi-member configuration, the integration owner must ensure
-that every member subscription is discovered before Member 01 publishes the
-initial token; the current Member 01 checks publisher subscription count.
+All nine member nodes are **always running**. Only the node currently holding the turn
+token executes its drawing; the others receive the token, check that the `active_member`
+field does not match their own ID, and publish a `WAITING_FOR_MEMBER_NN` status, then
+return without doing anything else.
 
-### Status topic
+---
 
-`/digit_relay/status`, type `std_msgs/msg/String`, is for human-readable
-diagnostics, not turn coordination. The template includes a publisher. Useful
-states include `WAITING_FOR_TURN`, `WAITING_FOR_MEMBER_XX`, `DRAWING`, `ERROR`,
-and `COMPLETE`. In the one-member demo, turn 1 and turn 2 are both assigned to
-Member 01, so no other member waits.
+## 4. ROS Communication Layer
 
-### Turtle topics and services
+### 4.1 Turn Topic — `/digit_relay/turn`
 
-| Name | Type | Purpose |
-|---|---|---|
-| `/turtle1/pose` | `turtlesim/msg/Pose` | Feedback for turtle position and heading. |
-| `/turtle1/cmd_vel` | `geometry_msgs/msg/Twist` | Motion commands while a member is drawing or moving to its slot. |
-| `/turtle1/set_pen` | `turtlesim/srv/SetPen` | Set pen RGB/width and lower (`off=False`) or lift (`off=True`) the pen. Each member owns its own client. |
-| `/clear` | `std_srvs/srv/Empty` | Clear the canvas before cycle two. Member 01 calls it at the beginning of turn 2 in this one-member configuration. |
-
-The member calls services asynchronously. If a service is not ready, a
-`STEADY_TIME` timer checks service availability until it can issue the request;
-there is no fixed sleep used to assume readiness. Drawing motion is driven by
-pose feedback rather than a guessed duration.
-
-## 4. Object-oriented contracts and available methods
-
-### `DigitRelayNode` — `relay_node.py`
-
-This abstract class extends `rclpy.node.Node`. It stores the member identity,
-group size, assigned `DigitSlot`, and busy flag. It deliberately does not own
-the turn topic or any member-specific service client.
-
-| Method | Kind | Contract / behavior |
-|---|---|---|
-| `__init__(member_id, total_members)` | Concrete | Names the ROS node, stores IDs, and calculates the assigned slot. |
-| `prepare_turn(number)` | Abstract | Member-specific asynchronous service preparation before a glyph is drawn. Must return a `Future`. |
-| `set_pen(off=...)` | Abstract | Member-specific `/turtle1/set_pen` call. Must return a `Future`. |
-| `draw_digit(number, slot)` | Abstract | Member-specific drawing hook. The `Future` must complete only when drawing is finished. |
-| `execute_turn(number)` | Concrete | Calls `prepare_turn()`, then calls `draw_digit()` after preparation succeeds. Returns a Future representing the full turn. |
-| `_fail_turn(reason)` | Concrete helper | Clears the busy flag and logs failure. A failed turn must not pass its token. |
-| `run_member(member_type)` | Module function | Initializes ROS, constructs and spins one member node, then destroys the node and shuts ROS down if still active. |
-
-Implementations should keep the ROS event loop non-blocking: return Futures for
-service and drawing work instead of calling `sleep()` or waiting synchronously.
-
-### `DigitDrawingMember` — `digit_drawing.py`
-
-This helper subclass adds glyph configuration and the pose-feedback drawing
-entry point. It expects each concrete member to create `_cmd_pub` and subscribe
-to pose with `_on_pose`.
-
-| Method / helper | Behavior |
+| Field | Value |
 |---|---|
-| `__init__(...)` | Stores pen color, glyph label, allowed turns, normalized strokes, and pose/job state. |
-| `_on_pose(pose)` | Stores the latest pose; logs when feedback first arrives. |
-| `_stop_turtle()` | Publishes a zero `Twist` command. |
-| `_draw_configured_glyph(number, slot)` | Validates the turn, maps normalized strokes into the slot, starts `_DigitDrawingJob`, and returns a completion Future. |
-| `_normalize_angle(angle)` | Wraps heading error into `[-π, π]`. |
-| `_map_glyph_to_slot(strokes, slot)` | Scales normalized glyph points into a safe area inside the member's slot. |
+| Type | `std_msgs/msg/Int32MultiArray` |
+| QoS Reliability | `RELIABLE` |
+| QoS Durability | `VOLATILE` |
+| QoS Depth | `1` |
 
-The internal `_DigitDrawingJob` has these steps:
+**Message format:**
+```
+data[0] = current_number   # Which turn number is active (1–18)
+data[1] = active_member    # Which member should draw (1–9)
+```
+
+The volatile durability is deliberate: it prevents late-joining subscribers from
+receiving stale turn tokens that were already processed. Every member creates both
+a publisher and a subscriber for this topic.
+
+Member 01 waits until its publisher has exactly `TOTAL_MEMBERS` (9) subscribers before
+publishing the first token `[1, 1]`. This guarantees all nodes are ready before the
+relay begins.
+
+### 4.2 Status Topic — `/digit_relay/status`
+
+| Field | Value |
+|---|---|
+| Type | `std_msgs/msg/String` |
+| QoS Reliability | `RELIABLE` |
+| QoS Depth | `1` |
+
+**Message format:**
+```
+member=NN state=STATE current_number=N active_member=N
+```
+
+Valid states published by any member:
+
+| State | Meaning |
+|---|---|
+| `WAITING_FOR_TURN` | Node has initialized and is listening for the first token. |
+| `WAITING_FOR_MEMBER_NN` | The current token is for another member; this member is idle. |
+| `DRAWING` | This member received its token and is executing its turn. |
+| `COMPLETE` | The relay has finished all 18 turns. |
+| `ERROR` | A service call or drawing operation failed on this member's turn. |
+
+### 4.3 Turtle Topics and Services
+
+| ROS name | Type | Direction | Purpose |
+|---|---|---|---|
+| `/turtle1/pose` | `turtlesim/msg/Pose` | turtlesim → members | Position (`x`, `y`) and heading (`theta`) feedback used by the motion controller. |
+| `/turtle1/cmd_vel` | `geometry_msgs/msg/Twist` | active member → turtlesim | Velocity commands that move the turtle. Only the currently drawing member publishes. |
+| `/turtle1/set_pen` | `turtlesim/srv/SetPen` | members → turtlesim | Set pen RGB color, width, and lift/lower state. Each member owns its own client. |
+| `/clear` | `std_srvs/srv/Empty` | Member 01 → turtlesim | Clear the canvas. Called once by Member 01 at the start of cycle two. |
+
+### 4.4 Service Discovery — No Fixed Sleeps
+
+Members do not assume a service is available immediately on startup. The helper
+`_call_service_when_ready(client, request, service_name)` checks
+`client.service_is_ready()` and, if not ready, creates a 100 ms `STEADY_TIME` timer
+that polls until the service appears. This avoids any `time.sleep()` that would block
+the ROS event loop.
+
+---
+
+## 5. Canvas and Slot System
+
+### Canvas dimensions (`digit_paths.py`)
+
+```
+CANVAS_WIDTH  = 11.0  (turtlesim x range: 0.0 to ~11.0)
+CANVAS_HEIGHT = 11.0  (turtlesim y range: 0.0 to ~11.0)
+CANVAS_MARGIN = 0.8   (border inset on all sides)
+SLOT_GAP_X    = 0.35  (horizontal gap between columns)
+SLOT_GAP_Y    = 0.35  (vertical gap between rows)
+```
+
+### 3×3 slot grid
+
+The canvas is divided into a fixed 3×3 grid. Each cell is assigned to exactly one
+member based on its ID:
+
+```
+┌──────────────────────────────────────┐
+│  Slot(1) M01  │ Slot(2) M02  │ Slot(3) M03  │  Row 0 (top)
+├──────────────────────────────────────┤
+│  Slot(4) M04  │ Slot(5) M05  │ Slot(6) M06  │  Row 1 (middle)
+├──────────────────────────────────────┤
+│  Slot(7) M07  │ Slot(8) M08  │ Slot(9) M09  │  Row 2 (bottom)
+└──────────────────────────────────────┘
+```
+
+Turtlesim's Y axis increases upward, so row 0 maps to the highest Y values.
+
+### `DigitSlot` NamedTuple
+
+```python
+class DigitSlot(NamedTuple):
+    x: float      # center X of the slot
+    y: float      # center Y of the slot
+    width: float  # usable width of the slot
+    height: float # usable height of the slot
+```
+
+### Slot allocation formula
+
+```python
+def slot_for_member(member_id: int, total_members: int) -> DigitSlot:
+    row, column = divmod(member_id - 1, SLOT_COLUMNS)   # 0-based row and column
+    x = CANVAS_MARGIN + SLOT_WIDTH / 2 + column * (SLOT_WIDTH + SLOT_GAP_X)
+    y = CANVAS_HEIGHT - CANVAS_MARGIN - SLOT_HEIGHT / 2 - row * (SLOT_HEIGHT + SLOT_GAP_Y)
+    return DigitSlot(x=x, y=y, width=SLOT_WIDTH, height=SLOT_HEIGHT)
+```
+
+### Glyph-to-slot mapping
+
+Normalized stroke coordinates (0.0–1.0) are scaled into each slot with a safe inner
+margin:
+
+```python
+glyph_width  = min(1.25, slot.width  - 0.3)
+glyph_height = min(1.9,  slot.height - 0.3)
+left_x   = slot.x - glyph_width / 2.0
+bottom_y = slot.y - glyph_height / 2.0
+
+mapped_x = left_x   + x * glyph_width
+mapped_y = bottom_y + y * glyph_height
+```
+
+This guarantees glyphs stay inside their slot and never overlap neighboring cells.
+
+---
+
+## 6. Class Hierarchy and Inheritance
+
+```
+rclpy.node.Node  (ABC)
+    │
+    └── DigitRelayNode            ← relay_node.py
+            │  - member_id, total_members, slot, _busy
+            │  - execute_turn()        (concrete)
+            │  - prepare_turn()        (abstract)
+            │  - set_pen()             (abstract)
+            │  - draw_digit()          (abstract)
+            │
+            └── DigitDrawingMember    ← digit_drawing.py
+                    │  - pen_color, glyph, valid_turn_numbers
+                    │  - _normalized_strokes, pose, _active_job
+                    │  - _on_pose()
+                    │  - _stop_turtle()
+                    │  - _draw_configured_glyph()
+                    │
+                    ├── Member01       ← member_01.py
+                    ├── Member02       ← member_02.py
+                    ├── Member03       ← member_03.py
+                    ├── Member04       ← member_04.py
+                    ├── Member05       ← member_05.py
+                    ├── Member06       ← member_06.py
+                    ├── Member07       ← member_07.py
+                    ├── Member08       ← member_08.py
+                    └── Member09       ← member_09.py
+```
+
+Each concrete `MemberNN` class:
+- Calls the drawing base constructor with its unique `member_id`, pen color, glyph
+  label, valid turns, and initial stroke paths.
+- Creates all of its own ROS publishers, subscribers, and service clients.
+- Implements `prepare_turn()`, `set_pen()`, and `draw_digit()`.
+- Implements `_on_turn()`, `_after_turn()`, `_publish_turn()`, `_publish_status()`,
+  and `_call_service_when_ready()`.
+
+---
+
+## 7. Module Reference
+
+### 7.1 `digit_paths.py`
+
+**Purpose:** Shared canvas geometry. No ROS imports.
+
+#### Constants
+
+| Name | Value | Description |
+|---|---|---|
+| `CANVAS_WIDTH` | `11.0` | Turtlesim X range |
+| `CANVAS_HEIGHT` | `11.0` | Turtlesim Y range |
+| `CANVAS_MARGIN` | `0.8` | Border inset |
+| `SLOT_COLUMNS` | `3` | Grid columns |
+| `SLOT_ROWS` | `3` | Grid rows |
+| `SLOT_GAP_X` | `0.35` | Horizontal gap between slots |
+| `SLOT_GAP_Y` | `0.35` | Vertical gap between slots |
+| `MAX_MEMBERS` | `9` | Maximum supported members |
+| `SLOT_WIDTH` | computed | Width of one slot cell |
+| `SLOT_HEIGHT` | computed | Height of one slot cell |
+
+#### `DigitSlot`
+
+```python
+class DigitSlot(NamedTuple):
+    x: float      # Center X in canvas coordinates
+    y: float      # Center Y in canvas coordinates
+    width: float  # Usable slot width
+    height: float # Usable slot height
+```
+
+#### `slot_for_member(member_id, total_members) -> DigitSlot`
+
+Returns the pre-computed slot for the given 1-based member ID. Validates that
+`1 ≤ member_id ≤ total_members ≤ 9`. Raises `ValueError` otherwise.
+
+---
+
+### 7.2 `relay_node.py`
+
+**Purpose:** Abstract base class that defines the member contract without owning
+any ROS endpoints.
+
+#### `class DigitRelayNode(Node, ABC)`
+
+Inherits from `rclpy.node.Node` and `ABC`. Names the node
+`digit_relay_member_NN` based on `member_id`.
+
+**Constructor** `__init__(*, member_id, total_members)`
+
+| Sets | Description |
+|---|---|
+| `self.member_id` | 1-based integer ID |
+| `self.total_members` | Total group size (9) |
+| `self.slot` | Pre-computed `DigitSlot` from `slot_for_member()` |
+| `self._busy` | Boolean guard to prevent duplicate turn execution |
+
+**Abstract methods** — must be implemented by every concrete member:
+
+| Method | Signature | Contract |
+|---|---|---|
+| `prepare_turn` | `(number: int) -> Future` | Run service calls (pen lift, canvas clear) before drawing begins. Must return a Future that resolves when preparation is complete. |
+| `set_pen` | `(*, off: bool) -> Future` | Call `/turtle1/set_pen` using this member's own service client. Must return a Future. |
+| `draw_digit` | `(number: int, slot: DigitSlot) -> Future` | Execute the glyph drawing. The Future must resolve only after the turtle has stopped and the glyph is complete. |
+
+**Concrete methods:**
 
 | Method | Behavior |
 |---|---|
-| `_set_pen(off, next_state)` | Requests a pen state change and proceeds after its Future completes. |
-| `_pen_done(future, next_state)` | Advances the motion state or fails the drawing Future. |
-| `_tick()` | Timer callback: waits for pose and a turtlesim command subscriber, then advances the current stroke state. |
-| `_drive_to(target, pose)` | Computes heading and distance errors, publishes bounded velocity, and reports when the target is reached. |
-| `_finish()` | Stops the turtle, cancels the timer, and completes the Future successfully. |
-| `_fail(error)` | Stops the turtle, cancels the timer, and completes the Future with an error. |
+| `execute_turn(number)` | Chains `prepare_turn()` and `draw_digit()` using Future callbacks. Returns a single outer Future that resolves when both steps complete. If either step raises, the outer Future is resolved with that exception. |
+| `_fail_turn(reason)` | Clears `_busy`, logs an error. The turn token is intentionally not passed on failure. |
 
-### `Member01` — `member_01.py`
+#### `run_member(member_type)`
 
-| Method | When / what it does |
+Module-level function. Calls `rclpy.init()`, constructs a node of the given type,
+calls `rclpy.spin()` (blocking), then destroys the node and shuts ROS down after
+spin exits. Used as the `main()` body in every member file.
+
+---
+
+### 7.3 `digit_drawing.py`
+
+**Purpose:** Adds glyph configuration and the pose-feedback drawing engine to the
+abstract base. Members that inherit from this class get the full drawing controller
+for free.
+
+#### `class DigitDrawingMember(DigitRelayNode)`
+
+**Constructor** `__init__(*, member_id, total_members, pen_color, glyph, valid_turn_numbers, normalized_strokes)`
+
+| Parameter | Type | Description |
+|---|---|---|
+| `pen_color` | `tuple[int,int,int]` | RGB pen color, each channel 0–255 |
+| `glyph` | `str` | Human-readable glyph label for logging |
+| `valid_turn_numbers` | `tuple[int,...]` | Turns this member is allowed to draw on |
+| `normalized_strokes` | `Sequence[Stroke]` | Initial stroke paths normalized to `[0,1]²` |
+
+Additional state:
+- `self.pose` — latest `turtlesim/Pose` received; `None` until the first pose arrives.
+- `self._pose_seen` — logs once when the first pose is received.
+- `self._active_job` — the current `_DigitDrawingJob` instance, or `None`.
+
+**Methods:**
+
+| Method | Description |
 |---|---|
-| `__init__()` | Calls the drawing base constructor; creates its own service clients, motion endpoints, turn endpoints, and status publisher; publishes an initial waiting state and starts readiness discovery. |
-| `_publish_initial_turn()` | Timer callback. Once its expected turn subscription count is present, cancels the timer and publishes `[1, 1]`. |
-| `_on_turn(message)` | Validates the token, stays idle for a token assigned elsewhere, rejects invalid/duplicate/busy turns, and starts `execute_turn()` for its own valid turn. |
-| `_after_turn(future, current_number)` | Handles errors; after success publishes the next token, or marks complete and shuts down after the final turn. |
-| `_publish_turn(current_number, active_member)` | Publishes the two integer fields on `/digit_relay/turn`. |
-| `_publish_status(state, current_number, active_member)` | Publishes diagnostics to `/digit_relay/status` and logs the same status. |
-| `set_pen(off=...)` | Builds a SetPen request using Member 01's RGB color and width, then calls its service helper. |
-| `prepare_turn(number)` | Lifts the pen before drawing; on the first turn of cycle two, first calls `/clear` and waits for it to complete. |
-| `_call_service_when_ready(client, request, service_name)` | Waits asynchronously for service discovery, calls `call_async()`, and resolves a standard Future from the ROS response Future. |
-| `draw_digit(number, slot)` | Invokes the shared drawing controller for Member 01's glyph 1. |
-| `main()` | Starts this node through `run_member(Member01)`. |
+| `_on_pose(pose)` | Stores the latest pose; logs when first received. Called by each member's `/turtle1/pose` subscription. |
+| `_stop_turtle()` | Publishes a zero `Twist` to `/turtle1/cmd_vel`, stopping the turtle immediately. |
+| `_draw_configured_glyph(number, slot)` | Validates that `number` is in `valid_turn_numbers`. Maps normalized strokes into the slot, creates a `_DigitDrawingJob`, and returns its completion `Future`. |
 
-Current constants are `MEMBER_ID = 1`, `TOTAL_MEMBERS = 1`, and
-`VALID_TURNS = (1, 2)`. Thus turn 2 is both the beginning of cycle two and the
-final turn. Its preparation calls `/clear` before drawing glyph 1 again.
+**Module-level helpers:**
 
-## 5. Member 01 call sequence
+| Helper | Description |
+|---|---|
+| `_normalize_angle(angle)` | Wraps any angle to `[−π, π]` using `atan2(sin, cos)`. |
+| `_map_glyph_to_slot(strokes, slot)` | Scales all normalized `(x,y)` points into the safe drawing area inside the given slot. Returns a new list of world-coordinate strokes. |
 
-```text
+#### `class _DigitDrawingJob`
+
+Internal class, created once per `_draw_configured_glyph()` call. Controls the turtle
+through all strokes via a 30 Hz timer driven by `STEADY_TIME` (wall clock, not sim
+time).
+
+**State machine within `_tick()`:**
+
+```
+  [move_to_stroke_start]
+         │
+         │ turtle reached stroke[i][0]
+         ▼
+  [waiting_for_pen]  ←── set_pen(off=False)
+         │
+         │ pen lowered
+         ▼
+  [drawing_stroke]
+         │
+         │ all points in stroke[i] drawn
+         ▼
+  [waiting_for_pen]  ←── set_pen(off=True)
+         │
+         │ pen lifted
+         ▼
+  [next_stroke]
+         │
+         ├── more strokes? → back to [move_to_stroke_start] (stroke_index++)
+         │
+         └── no more strokes? → _finish()
+```
+
+**`_drive_to(target, pose) -> bool`**
+
+Computes heading error and distance to `target`, publishes a `Twist` command, returns
+`True` when the turtle is within 0.035 units of the target:
+
+```
+heading_error = normalize_angle(atan2(dy, dx) - pose.theta)
+
+if |heading_error| > 0.12:
+    # Pure rotation mode
+    angular.z = clamp(3.0 * heading_error, -1.5, 1.5)
+else:
+    # Combined forward + angular correction
+    linear.x  = min(1.2, 1.5 * distance)
+    angular.z = clamp(2.5 * heading_error, -1.0, 1.0)
+```
+
+---
+
+### 7.4 `member_01.py` through `member_09.py`
+
+All nine member files follow the same pattern. The differences are the `MEMBER_ID`,
+pen color, glyph stroke paths, and—for Member 01—the canvas-clear call in
+`prepare_turn()`.
+
+#### Common pattern for every member
+
+**Module constants:**
+```python
+MEMBER_ID     = N               # 1-based
+TOTAL_MEMBERS = 9
+PEN_COLOR     = (R, G, B)
+FIRST_TURN    = MEMBER_ID       # Turn in cycle 1
+SECOND_TURN   = TOTAL_MEMBERS + MEMBER_ID  # Turn in cycle 2
+VALID_TURNS   = (FIRST_TURN, SECOND_TURN)
+GLYPH_X_STROKES  = (...)       # Cycle-1 glyph, normalized
+GLYPH_XY_STROKES = (...)       # Cycle-2 glyph, normalized
+```
+
+**`__init__()` — creates all ROS endpoints:**
+```
+_pen_client   ← create_client(SetPen, '/turtle1/set_pen')
+_cmd_pub      ← create_publisher(Twist, '/turtle1/cmd_vel', 10)
+_pose_sub     ← create_subscription(Pose, '/turtle1/pose', _on_pose, 10)
+_turn_pub     ← create_publisher(Int32MultiArray, '/digit_relay/turn', TURN_QOS)
+_turn_sub     ← create_subscription(Int32MultiArray, '/digit_relay/turn', _on_turn, TURN_QOS)
+_status_pub   ← create_publisher(String, '/digit_relay/status', STATUS_QOS)
+```
+
+**`_on_turn(message)` — turn token receiver:**
+
+```
+Receive [current_number, active_member]
+│
+├── active_member ≠ self.member_id?
+│       → publish WAITING_FOR_MEMBER_NN, return
+│
+├── _busy or current_number not in VALID_TURNS?
+│       → silently ignore (duplicate or invalid token)
+│
+├── current_number ≤ _last_completed_number?
+│       → silently ignore (already processed)
+│
+└── set _busy = True
+    publish DRAWING status
+    call execute_turn(current_number)
+        .add_done_callback(_after_turn)
+```
+
+**`_after_turn(future, current_number)` — turn completion handler:**
+
+```
+Receive Future result
+│
+├── Exception? → publish ERROR, call _fail_turn(), return
+│
+├── current_number == 2 * total_members (final turn)?
+│       → publish COMPLETE, call rclpy.shutdown()
+│
+└── compute next token:
+        next_number  = current_number + 1
+        next_member  = (next_number - 1) % total_members + 1
+    publish turn token [next_number, next_member]
+    publish WAITING_FOR_MEMBER_NN status
+```
+
+**`prepare_turn(number)` → Future:**
+
+- For Members 02–09: lifts the pen (`set_pen(off=True)`).
+- For Member 01 on turn `TOTAL_MEMBERS + 1` (turn 10): calls `/clear` first, waits
+  for it to complete, then lifts the pen. On turn 1, lifts the pen only.
+
+**`draw_digit(number, slot)` → Future:**
+
+- Selects the correct stroke path based on whether `number` is the first or second turn.
+- Calls `_draw_configured_glyph(number, slot)` with the updated strokes.
+
+**`set_pen(*, off)` → Future:**
+
+- Builds a `SetPen.Request` with the member's own `PEN_COLOR` and width `2`.
+- Delegates to `_call_service_when_ready()`.
+
+**`_call_service_when_ready(client, request, service_name)` → Future:**
+
+- If `client.service_is_ready()`: calls `call_async(request)` immediately.
+- Otherwise: starts a 100 ms `STEADY_TIME` timer that polls until the service is
+  ready, then calls it. The returned Future resolves with the service response.
+
+**`_publish_turn(current_number, active_member)`** — publishes
+`Int32MultiArray([current_number, active_member])` to `/digit_relay/turn`.
+
+**`_publish_status(state, current_number, active_member)`** — formats and publishes
+to `/digit_relay/status` and logs the same string.
+
+#### Member 01 — special role: token initiator and cycle-two clearer
+
+Member 01 is responsible for:
+1. Waiting until all 9 member subscriptions to `/digit_relay/turn` are visible
+   (polls `_turn_pub.get_subscription_count()` every 100 ms).
+2. Publishing the first token `[1, 1]` once all subscribers are ready.
+3. Calling `/clear` at the start of cycle two (turn 10) before lifting its pen.
+
+No other member performs these actions.
+
+#### Member 09 — special role: relay terminator
+
+Member 09 processes the final turn (turn 18). After its drawing Future completes,
+`_after_turn()` detects `current_number == 2 * total_members`, publishes `COMPLETE`,
+and calls `rclpy.shutdown()`. The launch file monitors Member 09's process exit and
+shuts down turtlesim.
+
+---
+
+### 7.5 `relay.launch.py`
+
+```python
+def generate_launch_description():
+    turtlesim = Node(package='turtlesim', executable='turtlesim_node', ...)
+    member_01 = Node(package='digit_relay', executable='digit_relay_member_01', ...)
+    member_02 = ...
+    ...
+    member_09 = ...
+    shutdown_when_complete = RegisterEventHandler(
+        OnProcessExit(
+            target_action=member_09,
+            on_exit=[Shutdown(reason='Distributed digit relay completed.')]
+        )
+    )
+    return LaunchDescription([turtlesim, member_01, ..., member_09, shutdown_when_complete])
+```
+
+All ten processes start simultaneously. The shutdown event is triggered when
+`digit_relay_member_09` exits (which only happens after it calls `rclpy.shutdown()`).
+At that point, ROS terminates turtlesim and all remaining member processes.
+
+---
+
+### 7.6 `setup.py` and `package.xml`
+
+`setup.py` registers nine console script entry points:
+
+```python
+'console_scripts': [
+    'digit_relay_member_01 = digit_relay.member_01:main',
+    'digit_relay_member_02 = digit_relay.member_02:main',
+    ...
+    'digit_relay_member_09 = digit_relay.member_09:main',
+]
+```
+
+`package.xml` declares runtime dependencies:
+- `rclpy` — ROS 2 Python client library
+- `std_msgs`, `std_srvs` — turn and status message types, `/clear` service
+- `geometry_msgs` — `Twist` for velocity commands
+- `turtlesim` — `Pose`, `SetPen`
+
+---
+
+## 8. Full Execution Flow
+
+```
 relay.launch.py
-  -> turtlesim_node + digit_relay_member_01
-  -> member_01.main()
-  -> run_member(Member01)
-  -> rclpy.init()
-  -> Member01.__init__(): create clients/endpoints, begin discovery check
-  -> rclpy.spin()
-  -> _publish_initial_turn(): publish [1, 1] once subscription is ready
-  -> _on_turn([1, 1])
-  -> execute_turn(1)
-       -> prepare_turn(1) -> set_pen(off=True)
-       -> draw_digit(1, slot) -> _draw_configured_glyph() -> movement/drawing
-  -> _after_turn(): publish [2, 1]
-  -> _on_turn([2, 1])
-  -> execute_turn(2)
-       -> prepare_turn(2) -> /clear -> set_pen(off=True)
-       -> draw_digit(2, slot) -> draw glyph 1 again
-  -> _after_turn(): publish COMPLETE, call rclpy.shutdown()
-  -> run_member() destroys the node
-  -> launch event shuts down turtlesim
+  │
+  ├── Starts: turtlesim_node
+  ├── Starts: digit_relay_member_01  (calls member_01.main())
+  ├── Starts: digit_relay_member_02  (calls member_02.main())
+  │   ...
+  └── Starts: digit_relay_member_09  (calls member_09.main())
+
+All members: run_member(MemberNN)
+  → rclpy.init()
+  → MemberNN.__init__()
+      → Create all ROS endpoints
+      → Publish WAITING_FOR_TURN
+  → rclpy.spin()                  ← event loop starts
+
+Member 01 only: _publish_initial_turn() [timer, 100ms poll]
+  → Wait until turn_pub has 9 subscribers
+  → Publish [1, 1]  ← relay begins
+
+─────────────────── CYCLE 1 (Turns 1–9) ───────────────────
+
+Turn 1 → Member 01:
+  _on_turn([1, 1])
+    set _busy = True, publish DRAWING
+    execute_turn(1)
+      prepare_turn(1) → set_pen(off=True)          ← lifts pen
+      [pen ready] → draw_digit(1, slot_01)
+        _draw_configured_glyph()
+          create _DigitDrawingJob
+            _tick() at 30Hz:
+              move to stroke start (pen up)
+              set_pen(off=False)                    ← lowers pen
+              drive through stroke points
+              set_pen(off=True)                     ← lifts pen
+              ... repeat for each stroke
+            _finish() → Future resolves
+  _after_turn() → publish [2, 2]
+
+Turn 2 → Member 02:
+  (same pattern as Turn 1, Member 02 draws glyph '2')
+  _after_turn() → publish [3, 3]
+
+...
+
+Turn 9 → Member 09:
+  (draws glyph '9')
+  _after_turn() → publish [10, 1]
+
+─────────────────── CYCLE 2 (Turns 10–18) ──────────────────
+
+Turn 10 → Member 01:
+  _on_turn([10, 1])
+    execute_turn(10)
+      prepare_turn(10):
+        call /clear → canvas wiped
+        [clear done] → set_pen(off=True)
+      draw_digit(10, slot_01)
+        glyph = '10', strokes = GLYPH_10_STROKES
+        _draw_configured_glyph() → draws "10" in slot 1
+  _after_turn() → publish [11, 2]
+
+Turn 11 → Member 02: draws '11'
+Turn 12 → Member 03: draws '12'
+...
+Turn 17 → Member 08: draws '17'
+
+Turn 18 → Member 09:
+  _on_turn([18, 9])
+    execute_turn(18) → draws '18'
+  _after_turn():
+    18 == 2 * 9 → final turn
+    publish COMPLETE
+    rclpy.shutdown()
+
+Member 09 process exits
+  → launch RegisterEventHandler fires
+  → Shutdown(reason='Distributed digit relay completed.')
+  → turtlesim and all other member processes terminate
 ```
 
-The executor is how a node waits: `rclpy.spin()` keeps it alive while it
-processes incoming messages, timers, and service responses. It does not need a
-blocking wait loop. In the future multi-member configuration, a member whose
-ID does not match `active_member` should publish its waiting status and return
-from `_on_turn()` without calling `execute_turn()`.
+---
 
-## 6. Contributor instructions for `member_xx.py`
+## 9. Turn Protocol State Machine
 
-Please treat `member_xx.py` as a **shared starter template**, not as your work
-file. Keeping one canonical template unchanged lets everyone start from the
-same contract and avoids teammates overwriting each other's edits. Follow this
-sequence:
+Every member node runs this implicit state machine:
 
-1. **Create your own file.** Copy the template to a unique name, for example
-   `member_02.py` or `member_07.py`. Do not rename or edit another teammate's
-   member file.
-2. **Choose your identity.** Set `MEMBER_ID` to your assigned 1-based member
-   number and `TOTAL_MEMBERS` to the agreed group size. These values must match
-   the integration configuration. Do not guess or independently change the
-   group size.
-3. **Set your two turn numbers.** The template formula is
-   `(MEMBER_ID, TOTAL_MEMBERS + MEMBER_ID)`: one turn in each cycle. Confirm the
-   group's agreed numbering scheme before changing it.
-4. **Choose a unique pen color.** Set `PEN_COLOR` to an RGB tuple with each
-   channel in the 0–255 range. Coordinate colors with the group so each member
-   is visually distinct.
-5. **Define a glyph.** Add normalized stroke paths, where each point is an
-   `(x, y)` pair between 0 and 1. To reuse the shared drawing controller, change
-   the template class to inherit from `DigitDrawingMember`, pass your glyph and
-   stroke paths to that class's constructor, and implement `draw_digit()` by
-   calling `_draw_configured_glyph(number, slot)`. Alternatively, implement an
-   equivalent pose-feedback routine yourself. Keep the glyph inside its slot
-   and return a Future that completes only when the turtle has stopped.
-6. **Keep member-owned ROS code in your file.** Create your own `/set_pen`
-   client, `/cmd_vel` publisher, `/pose` and turn subscribers, turn publisher,
-   and status publisher. Implement `_on_turn()`, `_after_turn()`, service
-   readiness handling, `prepare_turn()`, and `set_pen()` for your node. Do not
-   put your service client or topic callbacks in `relay_node.py`.
-7. **Preserve the turn protocol.** Subscribe to `/digit_relay/turn` and read
-   `[current_number, active_member]`. If the token is for another member,
-   publish a waiting status and return without moving. If it is yours, reject
-   duplicate/invalid tokens, run `execute_turn()`, and publish the next token
-   only after your drawing Future succeeds. Do not pass the token on failure.
-8. **Handle the last cycle correctly.** Only the node responsible for
-   `2 * TOTAL_MEMBERS` should publish `COMPLETE` and request ROS shutdown. The
-   launch integration must monitor that same final executable.
-9. **Ask the integration owner to wire it in.** The owner should add your
-   console entry in `setup.py`, add your node to `launch/relay.launch.py`,
-   update the initial-subscription readiness count, align all members'
-   `TOTAL_MEMBERS`, and select the final-node shutdown target. Avoid editing
-   those shared files in parallel unless the owner assigns that task to you.
-10. **Verify locally.** Build the package and run the one-command launch after
-    integration. Confirm node/topic endpoints, turn sequence, wait/draw status,
-    unique pen color, clear between cycles, and automatic shutdown.
+```
+                         ┌──────────────────────────────┐
+           Startup       │                              │
+         ─────────────── ▼                              │
+        │           [WAITING_FOR_TURN]                  │
+        │                │                              │
+        │         token received                        │
+        │                ▼                              │
+        │       active_member == self?                  │
+        │           /         \                         │
+        │         No           Yes                      │
+        │          │            │                       │
+        │          ▼            ▼                       │
+        │   [WAITING_FOR      _busy or already done?    │
+        │    MEMBER_NN]       /              \          │
+        │                   Yes              No         │
+        │                    │               │          │
+        │               (ignore)        [DRAWING]       │
+        │                                   │           │
+        │                              success?         │
+        │                            /        \         │
+        │                          No          Yes      │
+        │                           │            │      │
+        │                       [ERROR]    final turn?  │
+        │                                  /       \    │
+        │                                Yes        No  │
+        │                                 │          │  │
+        │                          [COMPLETE]   publish │
+        │                          shutdown     next    │
+        └───────────────────────────────  token ───────-┘
+```
 
-The template uses `raise NotImplementedError` in `draw_digit()` deliberately:
-it prevents an incomplete copy from appearing to implement drawing. Fill in
-the glyph/controller work before registering the new executable in the launch.
+---
 
-## 7. Git collaboration without avoidable conflicts
+## 10. Drawing Engine Internals
 
-Git can merge work cleanly when contributors work in separate files and keep
-shared integration changes coordinated. A recommended division is:
+### Timer and clock
 
-| Contributor | Files they should normally own |
+`_DigitDrawingJob` creates a 30 Hz ROS timer using `STEADY_TIME` (wall clock). This
+is essential: if the node is launched with `use_sim_time=True` but turtlesim is not
+publishing `/clock`, a `ROS_TIME` or `SIM_TIME` timer would stall indefinitely.
+
+### Waiting for prerequisites
+
+On each `_tick()`:
+1. If `self.completion.done()` or `state == 'waiting_for_pen'` → do nothing.
+2. If `pose is None` → log once, return. (Turtlesim not yet publishing `/pose`.)
+3. If `_cmd_pub.get_subscription_count() == 0` → log once, return. (Turtlesim not
+   yet subscribing to `/cmd_vel`.)
+
+Only when both pose and subscriber are present does the motion logic advance.
+
+### Motion control (`_drive_to`)
+
+The controller uses a simple proportional approach:
+
+```
+dx = target.x - pose.x
+dy = target.y - pose.y
+distance = hypot(dx, dy)
+
+if distance < 0.035:           # arrived — stop and return True
+    stop_turtle()
+    return True
+
+desired_heading = atan2(dy, dx)
+heading_error = normalize_angle(desired_heading - pose.theta)
+
+if |heading_error| > 0.12:    # large angle error — rotate in place
+    angular.z = clamp(3.0 * heading_error, -1.5, 1.5)
+    linear.x = 0
+else:                          # small angle error — move forward
+    linear.x  = min(1.2, 1.5 * distance)
+    angular.z = clamp(2.5 * heading_error, -1.0, 1.0)
+
+publish Twist
+return False
+```
+
+### Stroke sequence
+
+A glyph is a list of strokes. Each stroke is a list of waypoints:
+```
+stroke 0: [p0, p1, p2, ...]
+stroke 1: [p0, p1, ...]
+...
+```
+
+Between strokes the pen is lifted. Within a stroke the pen is lowered. The job
+always starts with the pen lifted (done by `prepare_turn`).
+
+```
+For each stroke[i]:
+    1. Pen is UP (from prepare_turn or previous stroke end)
+    2. Drive to stroke[i][0]                  (pen up move)
+    3. set_pen(off=False)                     (lower pen)
+    4. Drive to stroke[i][1], [2], ..., [n]   (draw)
+    5. set_pen(off=True)                      (lift pen)
+
+After all strokes: _finish() → complete Future
+```
+
+---
+
+## 11. Member Identity and Glyph Table
+
+| Member | ID | Pen Color (RGB) | Color Name | Cycle-1 Glyph | Cycle-2 Glyph | Slot (row,col) | Turns |
+|---|---|---|---|---|---|---|---|
+| Member 01 | 1 | (255, 60, 60) | Red | `1` | `10` | (1,1) | 1, 10 |
+| Member 02 | 2 | (255, 105, 180) | Hot Pink | `2` | `11` | (1,2) | 2, 11 |
+| Member 03 | 3 | (0, 255, 0) | Green | `3` | `12` | (1,3) | 3, 12 |
+| Member 04 | 4 | (255, 200, 40) | Yellow | `4` | `13` | (2,1) | 4, 13 |
+| Member 05 | 5 | (180, 90, 255) | Purple | `5` | `14` | (2,2) | 5, 14 |
+| Member 06 | 6 | (255, 140, 0) | Orange | `6` | `15` | (2,3) | 6, 15 |
+| Member 07 | 7 | (0, 255, 255) | Cyan | `7` | `16` | (3,1) | 7, 16 |
+| Member 08 | 8 | (128, 0, 0) | Dark Red | `8` | `17` | (3,2) | 8, 17 |
+| Member 09 | 9 | (255, 255, 255) | White | `9` | `18` | (3,3) | 9, 18 |
+
+**Turn number formula:**
+```
+FIRST_TURN  = MEMBER_ID
+SECOND_TURN = TOTAL_MEMBERS + MEMBER_ID    (= 9 + MEMBER_ID)
+```
+
+**Next-member formula (used in `_after_turn`):**
+```python
+next_number = current_number + 1
+next_member = (next_number - 1) % total_members + 1
+```
+This wraps correctly: after turn 9 (Member 09), next is turn 10 assigned to Member 01.
+
+---
+
+## 12. Error Handling and Safety
+
+| Situation | Behavior |
 |---|---|
-| Each member | Only their new `member_NN.py` file, created from the template. |
-| Integration owner | `setup.py`, `launch/relay.launch.py`, shared member-count/turn configuration, and final documentation. |
-| Group together | Agree IDs, colors, glyph assignments, turn numbering, and shutdown owner before implementation. |
+| Service call fails | Future resolves with exception. `_after_turn()` catches it, publishes `ERROR`, calls `_fail_turn()` which clears `_busy`. The turn token is **not passed**; the relay stalls. |
+| Drawing motion fails | Same as above—`_DigitDrawingJob._fail()` rejects the Future. |
+| Malformed turn token (fewer than 2 integers) | `_on_turn()` logs an error and returns. Token ignored. |
+| Duplicate turn token (same number received twice) | `current_number ≤ _last_completed_number` guard prevents re-execution. |
+| `_busy` is `True` when token arrives | Token silently dropped. Prevents concurrent drawing if a token is somehow re-received. |
+| Pose not yet available when drawing starts | `_tick()` logs a single warning and waits. Drawing starts as soon as pose arrives. |
+| `/turtle1/cmd_vel` has no subscriber (turtlesim not ready) | `_tick()` logs a single warning and waits. |
+| `KeyboardInterrupt` during spin | `run_member()` catches it in the `finally` block, destroys the node cleanly, and calls `rclpy.shutdown()` if still active. |
 
-### Repository owner: publish the project first
+---
 
-The project directory is not currently initialized as a Git repository. Create
-an empty GitHub repository (without an automatically generated README or
-license), then publish the project once:
+## 13. Build and Run
 
-```bash
-cd /path/to/distributed-digit-relay
-git init -b main
-git add .
-git commit -m "Add distributed digit relay ROS 2 package"
-git remote add origin https://github.com/USERNAME/REPOSITORY.git
-git push -u origin main
-```
-
-Replace the URL with the group's repository URL. Configure the commit identity
-for each contributor before committing:
-
-```bash
-git config user.name "Your Name"
-git config user.email "you@example.com"
-```
-
-### Per-member workflow
-
-Start from the latest shared branch and create a named branch:
-
-```bash
-git switch main
-git pull --ff-only
-git switch -c member-02-glyph
-```
-
-Create and edit only your own member file, then commit that focused change:
-
-```bash
-git add src/digit_relay/digit_relay/member_02.py
-git commit -m "Add Member 02 digit drawing node"
-git push -u origin member-02-glyph
-```
-
-Open a pull request into `main`. The integration owner reviews and merges it,
-then performs the shared `setup.py` and launch wiring in a separate integration
-change. Replace `02` and the branch name with your assigned member number.
-
-### Practices that prevent conflicts
-
-- Do not have every teammate edit `member_xx.py`; copy it and edit a unique
-  `member_NN.py` file.
-- Do not have multiple people edit `setup.py`, `relay.launch.py`, or the same
-  documentation section at once. Assign one integration owner for those files.
-- Pull the latest `main` before creating a branch. If your branch becomes old,
-  coordinate with the integration owner, then rebase or merge the updated
-  `main` before requesting review.
-- Keep each commit focused on one member or one integration task. Avoid mixing
-  unrelated formatting changes across everyone else's files.
-- Do not commit `build/`, `install/`, `log/`, `__pycache__/`, or editor files;
-  `.gitignore` already excludes these common generated files.
-- Use your own Git author identity so the commit history records who made each
-  contribution: `git config user.name` and `git config user.email`.
-- If the same shared file must be changed by two people, stop parallel edits
-  and have the integration owner combine the changes in sequence. A merge
-  conflict is resolved by agreeing on the intended final content, not by
-  blindly choosing one side.
-
-## 8. Build and run the current one-member example
+### Build
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd /path/to/ros2_ws
+
+# Remove stale build artifacts (important after adding/renaming members)
 rm -rf build/digit_relay install/digit_relay
+
 colcon build --packages-select digit_relay
 source install/setup.bash
+```
+
+### Run
+
+```bash
 ros2 launch digit_relay relay.launch.py
 ```
 
-If the workspace previously installed Member 02/03 executables, remove the
-package-specific build/install directories as shown above so those stale
-scripts do not remain in the install space. This cleanup does not remove other
-packages from the workspace. The launch starts turtlesim and Member 01; it
-exits automatically after two drawings. To inspect the graph while it is
-running, use another terminal with the ROS environment sourced:
+The relay starts all nodes, runs two full cycles (18 turns), and exits automatically.
+
+### Verify endpoints before launch (optional)
+
+After building:
+```bash
+ros2 run digit_relay digit_relay_member_01 &
+ros2 node list
+ros2 topic list
+kill %1
+```
+
+---
+
+## 14. Observability and Debugging
+
+While the launch is running, open a second terminal with the workspace sourced:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 cd /path/to/ros2_ws
 source install/setup.bash
-ros2 node list
-ros2 topic info /digit_relay/turn --verbose
-ros2 topic echo /digit_relay/turn
-ros2 topic echo /digit_relay/status
-ros2 service list
 ```
 
-The current demo has one turn publisher and one turn subscriber because it has
-one participant. Once members are integrated, endpoint counts should match the
-number of configured members. The status topic reports each member's observed
-state while the launch is active.
+### Watch the turn token flow
 
-## 9. Extending the example to a group
+```bash
+ros2 topic echo /digit_relay/turn
+# Each message shows: data: [current_number, active_member]
+```
 
-Adding member files alone is not sufficient to create a distributed relay.
-Before running a multi-member group, the integration owner must ensure that:
+### Watch all member statuses
 
-- every member agrees on `TOTAL_MEMBERS` and has a unique ID and slot;
-- turn numbers cover exactly two cycles and map to the intended member;
-- Member 01 emits the initial token only after all turn subscriptions are
-  discovered;
-- each member has one console script and one launch action;
-- all members create compatible volatile turn-topic endpoints;
-- cycle-two clearing happens once, before the first second-cycle glyph;
-- the last member owns the final turn and is the launch shutdown target.
+```bash
+ros2 topic echo /digit_relay/status
+# Shows: member=NN state=STATE current_number=N active_member=N
+```
 
-Until those shared changes are integrated, the checked-in launch intentionally
-runs only the single-member Member 01 demonstration.
+### Check all running nodes
+
+```bash
+ros2 node list
+# Should show: /digit_relay_member_01 through /digit_relay_member_09 + /turtlesim
+```
+
+### Inspect topic details
+
+```bash
+ros2 topic info /digit_relay/turn --verbose
+# Shows QoS settings and publisher/subscriber counts (should be 9+9)
+
+ros2 service list
+# Should show /turtle1/set_pen, /clear, etc.
+```
+
+### Check single member logs
+
+Each member node prints its status to the console (`output='screen'` in the launch
+file). You can filter for a specific member:
+
+```bash
+# (In the launch terminal output, each line is prefixed with [member_NN])
+```
+
+### Common issues
+
+| Symptom | Likely cause |
+|---|---|
+| Relay never starts (hangs at "Waiting until all 9...") | Not all 9 members are running or subscribed. Check `ros2 node list`. |
+| Turtle moves erratically | Multiple members publishing to `/cmd_vel` simultaneously (shouldn't happen in correct implementation). |
+| Turn stalls after a certain number | A member's `prepare_turn()` or `draw_digit()` Future never resolved (service unavailable or exception caught and swallowed). Check console for `ERROR` state. |
+| Canvas not cleared between cycles | Member 01's `/clear` client could not reach the service. Check turtlesim is running. |
