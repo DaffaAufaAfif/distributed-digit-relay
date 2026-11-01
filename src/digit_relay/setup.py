@@ -28,8 +28,16 @@ setup(
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
-        'console_scripts': [
-            'digit_relay_member_01 = digit_relay.member_01:main',
+    'console_scripts': [
+        'digit_relay_member_01 = digit_relay.member_01:main',
+        'digit_relay_member_02 = digit_relay.member_02:main',
+        'digit_relay_member_03 = digit_relay.member_03:main',
+        'digit_relay_member_04 = digit_relay.member_04:main',
+        'digit_relay_member_05 = digit_relay.member_05:main',
+        'digit_relay_member_06 = digit_relay.member_06:main',
+        'digit_relay_member_07 = digit_relay.member_07:main',
+        'digit_relay_member_08 = digit_relay.member_08:main',
+        'digit_relay_member_09 = digit_relay.member_09:main',
         ],
     },
 )

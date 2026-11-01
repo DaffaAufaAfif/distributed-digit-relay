@@ -29,7 +29,10 @@ STATUS_QOS = QoSProfile(
 MEMBER_ID = 3
 TOTAL_MEMBERS = 9
 PEN_COLOR = (0, 255, 0)  # Hijau
-VALID_TURNS = (MEMBER_ID, TOTAL_MEMBERS + MEMBER_ID)
+
+FIRST_TURN = MEMBER_ID
+SECOND_TURN = TOTAL_MEMBERS + MEMBER_ID
+VALID_TURNS = (FIRST_TURN, SECOND_TURN)
 
 # Strokes for digit '3', normalized to [0.0, 1.0] glyph box
 # where (0.0, 0.0) is bottom-left and (1.0, 1.0) is top-right.
@@ -38,6 +41,26 @@ GLYPH_3_STROKES = (
     ((0.0, 1.0), (1.0, 1.0), (1.0, 0.5), (0.0, 0.5)),
     # Garis tengah ke bawah
     ((0.0, 0.5), (1.0, 0.5), (1.0, 0.0), (0.0, 0.0)),
+)
+
+# Two-digit glyph '12'
+GLYPH_12_STROKES = (
+    # Digit '1' kiri
+    (
+        (0.10, 0.80),
+        (0.20, 1.00),
+        (0.20, 0.00),
+    ),
+    # Digit '2' kanan
+    (
+        (0.48, 0.80),
+        (0.60, 1.00),
+        (0.80, 1.00),
+        (0.92, 0.80),
+        (0.92, 0.62),
+        (0.48, 0.00),
+        (0.94, 0.00),
+    ),
 )
 
 
@@ -51,12 +74,14 @@ class Member03(DigitDrawingMember):
             valid_turn_numbers=VALID_TURNS,
             normalized_strokes=GLYPH_3_STROKES,
         )
+
         # Each member creates its own client for /turtle1/set_pen.
         self._pen_client = self.create_client(SetPen, '/turtle1/set_pen')
         self._cmd_pub = self.create_publisher(Twist, '/turtle1/cmd_vel', 10)
         self._pose_sub = self.create_subscription(
             Pose, '/turtle1/pose', self._on_pose, 10
         )
+
         # Each member also creates its own publisher and subscriber for turns.
         self._turn_pub = self.create_publisher(Int32MultiArray, TURN_TOPIC, TURN_QOS)
         self._turn_sub = self.create_subscription(
@@ -68,21 +93,31 @@ class Member03(DigitDrawingMember):
 
     def _on_turn(self, message: Int32MultiArray) -> None:
         if len(message.data) < 2:
-            self.get_logger().error('Ignoring malformed turn token; expected [number, member].')
-            return
-        current_number, active_member = message.data[:2]
-        if active_member != self.member_id:
-            self._publish_status(
-                f'WAITING_FOR_MEMBER_{active_member:02d}', current_number, active_member
+            self.get_logger().error(
+                'Ignoring malformed turn token; expected [number, member].'
             )
             return
+
+        current_number, active_member = message.data[:2]
+
+        if active_member != self.member_id:
+            self._publish_status(
+                f'WAITING_FOR_MEMBER_{active_member:02d}',
+                current_number,
+                active_member,
+            )
+            return
+
         if self._busy or current_number not in self.valid_turn_numbers:
             return
+
         if current_number <= self._last_completed_number:
             return
 
         self._busy = True
-        self.get_logger().info(f'My turn: drawing {current_number} in slot {self.member_id}.')
+        self.get_logger().info(
+            f'My turn: drawing {current_number} in slot {self.member_id}.'
+        )
         self._publish_status('DRAWING', current_number, active_member)
         self.execute_turn(current_number).add_done_callback(
             lambda future: self._after_turn(future, current_number)
@@ -98,6 +133,7 @@ class Member03(DigitDrawingMember):
 
         self._busy = False
         self._last_completed_number = current_number
+
         if current_number == 2 * self.total_members:
             self.get_logger().info('Relay complete: two full cycles have finished.')
             self._publish_status('COMPLETE', current_number, self.member_id)
@@ -108,7 +144,9 @@ class Member03(DigitDrawingMember):
         next_member = (next_number - 1) % self.total_members + 1
         self._publish_turn(next_number, next_member)
         self._publish_status(
-            f'WAITING_FOR_MEMBER_{next_member:02d}', next_number, next_member
+            f'WAITING_FOR_MEMBER_{next_member:02d}',
+            next_number,
+            next_member,
         )
 
     def _publish_turn(self, current_number: int, active_member: int) -> None:
@@ -146,9 +184,7 @@ class Member03(DigitDrawingMember):
         """Set this member's pen and lift it before drawing."""
         return self.set_pen(off=True)
 
-    def _call_service_when_ready(
-        self, client, request, service_name: str
-    ) -> Future:
+    def _call_service_when_ready(self, client, request, service_name: str) -> Future:
         """Wait for this node's service client, then call it asynchronously."""
         result: Future = Future()
 
@@ -173,7 +209,9 @@ class Member03(DigitDrawingMember):
             start_call()
             return result
 
-        self.get_logger().info(f'Waiting for service {service_name} to become available.')
+        self.get_logger().info(
+            f'Waiting for service {service_name} to become available.'
+        )
         timer_ref = {}
 
         def check_service_ready() -> None:
@@ -192,7 +230,14 @@ class Member03(DigitDrawingMember):
         return result
 
     def draw_digit(self, number: int, slot: DigitSlot) -> Future:
-        """Draw Member 03's configured glyph 3 in its assigned slot."""
+        """Draw glyph 3 on the first turn and glyph 12 on the second turn."""
+        if number == FIRST_TURN:
+            self.glyph = '3'
+            self._normalized_strokes = GLYPH_3_STROKES
+        else:
+            self.glyph = '12'
+            self._normalized_strokes = GLYPH_12_STROKES
+
         return self._draw_configured_glyph(number, slot)
 
 
