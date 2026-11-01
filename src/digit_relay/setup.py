@@ -28,6 +28,7 @@ setup(
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
+<<<<<<< Updated upstream
     'console_scripts': [
         'digit_relay_member_01 = digit_relay.member_01:main',
         'digit_relay_member_02 = digit_relay.member_02:main',
@@ -38,6 +39,11 @@ setup(
         'digit_relay_member_07 = digit_relay.member_07:main',
         ## 'digit_relay_member_08 = digit_relay.member_08:main',
         'digit_relay_member_09 = digit_relay.member_09:main',
+=======
+        'console_scripts': [
+            'digit_relay_member_01 = digit_relay.member_01:main',
+            'digit_relay_member_08 = digit_relay.member_08:main',
+>>>>>>> Stashed changes
         ],
     },
 )
