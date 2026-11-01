@@ -19,10 +19,22 @@ def generate_launch_description():
         name='member_01',
         output='screen',
     )
+    member_02 = Node(
+        package='digit_relay',
+        executable='digit_relay_member_02',
+        name='member_02',
+        output='screen',
+    )
+    member_03 = Node(
+        package='digit_relay',
+        executable='digit_relay_member_03',
+        name='member_03',
+        output='screen',
+    )
     # Member 01 owns the final turn in this single-member demonstration.
     shutdown_when_complete = RegisterEventHandler(
         OnProcessExit(
-            target_action=member_01,
+            target_action=member_03,
             on_exit=[Shutdown(reason='Distributed digit relay completed.')],
         )
     )
@@ -30,5 +42,7 @@ def generate_launch_description():
     return LaunchDescription([
         turtlesim,
         member_01,
+        member_02,
+        member_03,
         shutdown_when_complete,
     ])

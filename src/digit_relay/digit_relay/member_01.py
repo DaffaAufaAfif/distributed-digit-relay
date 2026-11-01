@@ -30,7 +30,7 @@ STATUS_QOS = QoSProfile(
 )
 
 MEMBER_ID = 1
-TOTAL_MEMBERS = 9
+TOTAL_MEMBERS = 3
 VALID_TURNS = (MEMBER_ID, TOTAL_MEMBERS + MEMBER_ID)
 
 # One vertical stroke, normalized to the glyph box.
