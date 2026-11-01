@@ -3,7 +3,7 @@
   <name>digit_relay</name>
   <version>0.0.1</version>
   <description>ROS 2 Python package for a distributed digit relay.</description>
-  <maintainer email="user@example.com">Package Maintainer</maintainer>
+  <maintainer email="daffaaufafif@gmail.com">Package Maintainer</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
