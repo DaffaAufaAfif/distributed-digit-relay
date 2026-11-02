@@ -1,4 +1,4 @@
-"""Member 01: draw 1 on its first turn and 10 at the start of cycle two."""
+"""Member 01: Daffa Aufa Afif (505451022)"""
 
 from concurrent.futures import Future
 
