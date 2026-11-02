@@ -1,10 +1,11 @@
 # Distributed Digit Relay (ROS 2)
 
-A ROS 2 Python package where **nine independent member nodes** coordinate through a shared
-turn-token topic to draw digits sequentially on a single turtlesim canvas. The relay runs
+A ROS 2 Python package where **nine independent member nodes** coordinate through per-member
+`take_turn` services to draw digits sequentially on a single turtlesim canvas. The relay runs
 **two full cycles**: each member draws its assigned single-digit glyph in cycle one, then
 draws its assigned two-digit glyph in cycle two. All nine members draw in parallel processes
-and communicate only through ROS topics—no shared memory, no direct calls between members.
+and hand the turn token to each other with service calls—no shared memory, no direct method
+calls between members.
 
 For full technical details, architecture, flow diagrams, and module reference, see
 [`doc/documentation.md`](doc/documentation.md).
@@ -28,9 +29,9 @@ source /opt/ros/jazzy/setup.bash
 cd /path/to/ros2_ws
 
 # Remove stale build artifacts from any previous build
-rm -rf build/digit_relay install/digit_relay
+rm -rf build/digit_relay build/digit_relay_interfaces install/digit_relay install/digit_relay_interfaces
 
-colcon build --packages-select digit_relay
+colcon build --packages-select digit_relay_interfaces digit_relay
 source install/setup.bash
 ```
 
@@ -58,10 +59,9 @@ cd /path/to/ros2_ws
 source install/setup.bash
 
 ros2 node list
-ros2 topic info /digit_relay/turn --verbose
-ros2 topic echo /digit_relay/turn
+ros2 service list | grep take_turn
+ros2 interface show digit_relay_interfaces/srv/TakeTurn
 ros2 topic echo /digit_relay/status
-ros2 service list
 ```
 
 ---

@@ -31,14 +31,15 @@
 nodes—called *members*—to draw digits on a single shared turtlesim canvas in a strict,
 turn-based sequence.
 
-The core idea is a **relay baton**: a turn token published on a shared ROS topic. Only the
-member that holds the token draws; all others wait and listen. When a member finishes
-drawing, it passes the token to the next member. This continues for two full cycles (18
-turns total), after which the system shuts down automatically.
+The core idea is a **relay baton**: a turn token passed between members with ROS service
+calls. Only the member that holds the token draws; all others wait for their `take_turn`
+service to be called. When a member finishes drawing, it calls the next member's service
+to pass the token. This continues for two full cycles (18 turns total), after which the
+system shuts down automatically.
 
 **Key design goals:**
 - Each member node is fully autonomous and owns its own ROS endpoints.
-- No shared memory, no direct calls between members—only ROS topic messages.
+- No shared memory, no direct calls between members—only ROS service calls and topics.
 - The drawing controller uses real-time pose feedback from turtlesim, not timed sleeps.
 - All asynchronous operations (service calls, drawing) return `concurrent.futures.Future`
   objects and are chained with callbacks—the ROS event loop is never blocked.
@@ -64,6 +65,11 @@ distributed-digit-relay/
 ├── doc/
 │   └── documentation.md              ← This file
 └── src/
+    ├── digit_relay_interfaces/        ← Service definitions (ament_cmake + rosidl)
+    │   ├── package.xml
+    │   ├── CMakeLists.txt
+    │   └── srv/
+    │       └── TakeTurn.srv           ← Turn-token handoff request/response
     └── digit_relay/                   ← ROS 2 Python package root
         ├── package.xml                ← ROS package metadata and dependencies
         ├── setup.py                   ← Python package entry points and install rules
@@ -75,7 +81,7 @@ distributed-digit-relay/
         └── digit_relay/               ← Python package (importable as `digit_relay`)
             ├── __init__.py
             ├── digit_paths.py         ← Canvas constants and slot allocation
-            ├── relay_node.py          ← Abstract base class and entry-point helper
+            ├── relay_node.py          ← Abstract base class: turn services + entry point
             ├── digit_drawing.py       ← Pose-feedback drawing controller
             ├── member_01.py           ← Concrete member: draws 1 / 10
             ├── member_02.py           ← Concrete member: draws 2 / 11
@@ -93,11 +99,12 @@ distributed-digit-relay/
 | File | Responsibility |
 |---|---|
 | `digit_paths.py` | Canvas dimensions, 3×3 grid constants, `DigitSlot` type, and `slot_for_member()` allocator. Pure math, no ROS. |
-| `relay_node.py` | Abstract base class `DigitRelayNode`: stores member identity and slot, declares abstract hooks (`prepare_turn`, `set_pen`, `draw_digit`), implements `execute_turn()` Future chaining, and provides `run_member()` entry point. No ROS topics created here. |
+| `relay_node.py` | Abstract base class `DigitRelayNode`: stores member identity and slot, owns the `take_turn` service server plus a client to every peer, runs the turn state machine (`_on_take_turn` service callback, `_after_turn`, `_handoff_turn`), implements `execute_turn()` Future chaining, and provides `run_member()` entry point. |
 | `digit_drawing.py` | `DigitDrawingMember` subclass: stores pen color and normalized stroke paths; exposes `_draw_configured_glyph()`. Inner class `_DigitDrawingJob` runs the actual pose-feedback motion loop. |
-| `member_NN.py` | Concrete node: creates all ROS endpoints (publishers, subscribers, service clients), implements the turn state machine, and provides glyph stroke data. |
+| `member_NN.py` | Concrete node: creates its turtle endpoints (cmd_vel publisher, pose subscriber, pen/clear service clients), implements `prepare_turn()`/`draw_digit()`, and provides glyph stroke data. |
 | `relay.launch.py` | ROS 2 launch description: starts `turtlesim_node` and all nine member executables simultaneously; registers a shutdown event on Member 09 exit. |
 | `setup.py` | Registers nine console script entry points (one per member) and installs the launch file. |
+| `digit_relay_interfaces/srv/TakeTurn.srv` | Service definition used to hand the turn token between members. |
 
 ---
 
@@ -112,8 +119,8 @@ distributed-digit-relay/
 │  └──────────┘  └────────┘  └────────┘     └────────┘   │
 └─────────────────────────────────────────────────────────┘
           │             │           │              │
-          │   /digit_relay/turn  (Int32MultiArray) │
-          │      ←────────────────────────────────→
+          │   /digit_relay/member_NN/take_turn  (digit_relay_interfaces/TakeTurn)
+          │      ←────────────── (previous member calls next member)
           │
           │   /digit_relay/status (String)
           │      ←────────────────────────────────
@@ -131,37 +138,40 @@ distributed-digit-relay/
           │      ←──────────── (Member 01 calls at turn 10)
 ```
 
-All nine member nodes are **always running**. Only the node currently holding the turn
-token executes its drawing; the others receive the token, check that the `active_member`
-field does not match their own ID, and publish a `WAITING_FOR_MEMBER_NN` status, then
-return without doing anything else.
+All nine member nodes are **always running**. Each exposes its own
+`/digit_relay/member_NN/take_turn` service. Only the node currently holding the turn
+token executes its drawing; when it finishes it calls the next member's `take_turn`
+service with the incremented turn number, and publishes a `WAITING_FOR_MEMBER_NN` status
+while waiting for that handoff to be accepted.
 
 ---
 
 ## 4. ROS Communication Layer
 
-### 4.1 Turn Topic — `/digit_relay/turn`
+### 4.1 Turn Service — `/digit_relay/member_NN/take_turn`
 
 | Field | Value |
 |---|---|
-| Type | `std_msgs/msg/Int32MultiArray` |
-| QoS Reliability | `RELIABLE` |
-| QoS Durability | `VOLATILE` |
-| QoS Depth | `1` |
+| Type | `digit_relay_interfaces/srv/TakeTurn` |
+| Servers | One per member (`/digit_relay/member_01/take_turn` … `/digit_relay/member_09/take_turn`) |
+| Clients | Every member keeps a client to every peer |
 
-**Message format:**
+**Service definition (`TakeTurn.srv`):**
 ```
-data[0] = current_number   # Which turn number is active (1–18)
-data[1] = active_member    # Which member should draw (1–9)
+int32 current_number    # Which turn number is being handed over (1–18)
+---
+bool accepted           # True when the member started the turn
+string message          # Acceptance/rejection explanation
 ```
 
-The volatile durability is deliberate: it prevents late-joining subscribers from
-receiving stale turn tokens that were already processed. Every member creates both
-a publisher and a subscriber for this topic.
+The turn token travels as a service call instead of a broadcast topic: the member that
+finishes a turn calls `take_turn` on the member that owns the next turn number. The
+service callback validates the request, starts drawing asynchronously, and returns
+`accepted=True` immediately so the executor stays free for pose feedback and timers.
 
-Member 01 waits until its publisher has exactly `TOTAL_MEMBERS` (9) subscribers before
-publishing the first token `[1, 1]`. This guarantees all nodes are ready before the
-relay begins.
+Member 01 waits until every peer's `take_turn` service is discoverable (polls
+`client.service_is_ready()` every 100 ms) before claiming turn 1 locally. This
+guarantees all nodes are ready before the relay begins.
 
 ### 4.2 Status Topic — `/digit_relay/status`
 
@@ -180,8 +190,8 @@ Valid states published by any member:
 
 | State | Meaning |
 |---|---|
-| `WAITING_FOR_TURN` | Node has initialized and is listening for the first token. |
-| `WAITING_FOR_MEMBER_NN` | The current token is for another member; this member is idle. |
+| `WAITING_FOR_TURN` | Node has initialized and is waiting for its turn service to be called. |
+| `WAITING_FOR_MEMBER_NN` | This member finished its turn and handed the token to member NN; it is idle. |
 | `DRAWING` | This member received its token and is executing its turn. |
 | `COMPLETE` | The relay has finished all 18 turns. |
 | `ERROR` | A service call or drawing operation failed on this member's turn. |
@@ -306,10 +316,11 @@ rclpy.node.Node  (ABC)
 Each concrete `MemberNN` class:
 - Calls the drawing base constructor with its unique `member_id`, pen color, glyph
   label, valid turns, and initial stroke paths.
-- Creates all of its own ROS publishers, subscribers, and service clients.
+- Creates its turtle endpoints: pen/clear service clients, `cmd_vel` publisher, and
+  `pose` subscriber.
 - Implements `prepare_turn()`, `set_pen()`, and `draw_digit()`.
-- Implements `_on_turn()`, `_after_turn()`, `_publish_turn()`, `_publish_status()`,
-  and `_call_service_when_ready()`.
+- Inherits turn coordination (`take_turn` service, handoff, status publishing) from
+  `DigitRelayNode`.
 
 ---
 
@@ -353,22 +364,26 @@ Returns the pre-computed slot for the given 1-based member ID. Validates that
 
 ### 7.2 `relay_node.py`
 
-**Purpose:** Abstract base class that defines the member contract without owning
-any ROS endpoints.
+**Purpose:** Abstract base class that owns turn coordination (service server, peer
+clients, status topic) and defines the member drawing contract.
 
 #### `class DigitRelayNode(Node, ABC)`
 
 Inherits from `rclpy.node.Node` and `ABC`. Names the node
 `digit_relay_member_NN` based on `member_id`.
 
-**Constructor** `__init__(*, member_id, total_members)`
+**Constructor** `__init__(*, member_id, total_members, valid_turn_numbers)`
 
 | Sets | Description |
 |---|---|
 | `self.member_id` | 1-based integer ID |
 | `self.total_members` | Total group size (9) |
+| `self.valid_turn_numbers` | Turn numbers this member may draw |
 | `self.slot` | Pre-computed `DigitSlot` from `slot_for_member()` |
 | `self._busy` | Boolean guard to prevent duplicate turn execution |
+| `self._turn_service` | `take_turn` service server for this member |
+| `self._turn_clients` | Dict of `take_turn` clients, one per peer |
+| `self._status_pub` | Publisher for `/digit_relay/status` |
 
 **Abstract methods** — must be implemented by every concrete member:
 
@@ -382,8 +397,14 @@ Inherits from `rclpy.node.Node` and `ABC`. Names the node
 
 | Method | Behavior |
 |---|---|
+| `start_relay()` | Member 01 only: polls until every peer's `take_turn` service is ready, then claims turn 1 locally. |
+| `_on_take_turn(request, response)` | Service callback: validates the token, starts `execute_turn()`, and replies with `accepted` without blocking the executor. |
+| `_after_turn(future, number)` | On success computes the next turn/member and calls `_handoff_turn()`; on failure publishes `ERROR` and intentionally does not pass the token. On turn 18 publishes `COMPLETE` and shuts ROS down. |
+| `_handoff_turn(number, member)` | Calls the next member's `take_turn` service and logs acceptance or rejection. |
 | `execute_turn(number)` | Chains `prepare_turn()` and `draw_digit()` using Future callbacks. Returns a single outer Future that resolves when both steps complete. If either step raises, the outer Future is resolved with that exception. |
 | `_fail_turn(reason)` | Clears `_busy`, logs an error. The turn token is intentionally not passed on failure. |
+| `_publish_status(...)` | Formats and publishes to `/digit_relay/status` and logs the same string. |
+| `_call_service_when_ready(client, request, name)` | Calls a service immediately if ready, otherwise polls with a 100 ms `STEADY_TIME` timer. Returns a Future. |
 
 #### `run_member(member_type)`
 
@@ -501,34 +522,36 @@ GLYPH_X_STROKES  = (...)       # Cycle-1 glyph, normalized
 GLYPH_XY_STROKES = (...)       # Cycle-2 glyph, normalized
 ```
 
-**`__init__()` — creates all ROS endpoints:**
+**`__init__()` — creates this member's turtle endpoints:**
 ```
 _pen_client   ← create_client(SetPen, '/turtle1/set_pen')
 _cmd_pub      ← create_publisher(Twist, '/turtle1/cmd_vel', 10)
 _pose_sub     ← create_subscription(Pose, '/turtle1/pose', _on_pose, 10)
-_turn_pub     ← create_publisher(Int32MultiArray, '/digit_relay/turn', TURN_QOS)
-_turn_sub     ← create_subscription(Int32MultiArray, '/digit_relay/turn', _on_turn, TURN_QOS)
-_status_pub   ← create_publisher(String, '/digit_relay/status', STATUS_QOS)
+(Member 01 also: _clear_client ← create_client(Empty, '/clear'), start_relay())
 ```
 
-**`_on_turn(message)` — turn token receiver:**
+Turn endpoints (`_turn_service`, `_turn_clients`, `_status_pub`) are created by the
+`DigitRelayNode` base constructor.
+
+**`_on_take_turn(request, response)` — turn token service callback:**
 
 ```
-Receive [current_number, active_member]
+Receive TakeTurn.Request(current_number)
 │
-├── active_member ≠ self.member_id?
-│       → publish WAITING_FOR_MEMBER_NN, return
+├── _busy?
+│       → accepted=False ("member is busy")
 │
-├── _busy or current_number not in VALID_TURNS?
-│       → silently ignore (duplicate or invalid token)
+├── current_number not in VALID_TURNS?
+│       → accepted=False (turn belongs to another member)
 │
 ├── current_number ≤ _last_completed_number?
-│       → silently ignore (already processed)
+│       → accepted=False (already processed)
 │
 └── set _busy = True
     publish DRAWING status
     call execute_turn(current_number)
         .add_done_callback(_after_turn)
+    return accepted=True   ← replied immediately, drawing runs in background
 ```
 
 **`_after_turn(future, current_number)` — turn completion handler:**
@@ -537,6 +560,7 @@ Receive [current_number, active_member]
 Receive Future result
 │
 ├── Exception? → publish ERROR, call _fail_turn(), return
+│                (token is NOT handed off — relay stalls by design)
 │
 ├── current_number == 2 * total_members (final turn)?
 │       → publish COMPLETE, call rclpy.shutdown()
@@ -544,8 +568,10 @@ Receive Future result
 └── compute next token:
         next_number  = current_number + 1
         next_member  = (next_number - 1) % total_members + 1
-    publish turn token [next_number, next_member]
     publish WAITING_FOR_MEMBER_NN status
+    _handoff_turn(next_number, next_member)
+        → call /digit_relay/member_NN/take_turn(next_number)
+        → log accepted / rejected
 ```
 
 **`prepare_turn(number)` → Future:**
@@ -570,18 +596,15 @@ Receive Future result
 - Otherwise: starts a 100 ms `STEADY_TIME` timer that polls until the service is
   ready, then calls it. The returned Future resolves with the service response.
 
-**`_publish_turn(current_number, active_member)`** — publishes
-`Int32MultiArray([current_number, active_member])` to `/digit_relay/turn`.
-
 **`_publish_status(state, current_number, active_member)`** — formats and publishes
 to `/digit_relay/status` and logs the same string.
 
-#### Member 01 — special role: token initiator and cycle-two clearer
+#### Member 01 — special role: relay initiator and cycle-two clearer
 
 Member 01 is responsible for:
-1. Waiting until all 9 member subscriptions to `/digit_relay/turn` are visible
-   (polls `_turn_pub.get_subscription_count()` every 100 ms).
-2. Publishing the first token `[1, 1]` once all subscribers are ready.
+1. Waiting until all 8 peer `take_turn` services are discoverable
+   (polls `client.service_is_ready()` every 100 ms via `start_relay()`).
+2. Claiming turn 1 locally once every peer is ready — the relay begins.
 3. Calling `/clear` at the start of cycle two (turn 10) before lifting its pen.
 
 No other member performs these actions.
@@ -633,8 +656,9 @@ At that point, ROS terminates turtlesim and all remaining member processes.
 ```
 
 `package.xml` declares runtime dependencies:
+- `digit_relay_interfaces` — `TakeTurn` service definition for token handoffs
 - `rclpy` — ROS 2 Python client library
-- `std_msgs`, `std_srvs` — turn and status message types, `/clear` service
+- `std_msgs`, `std_srvs` — status message type, `/clear` service
 - `geometry_msgs` — `Twist` for velocity commands
 - `turtlesim` — `Pose`, `SetPen`
 
@@ -654,18 +678,18 @@ relay.launch.py
 All members: run_member(MemberNN)
   → rclpy.init()
   → MemberNN.__init__()
-      → Create all ROS endpoints
+      → Create take_turn service + peer clients, turtle endpoints
       → Publish WAITING_FOR_TURN
   → rclpy.spin()                  ← event loop starts
 
-Member 01 only: _publish_initial_turn() [timer, 100ms poll]
-  → Wait until turn_pub has 9 subscribers
-  → Publish [1, 1]  ← relay begins
+Member 01 only: start_relay() [timer, 100ms poll]
+  → Wait until all 8 peer take_turn services are ready
+  → Claim turn 1 locally         ← relay begins
 
 ─────────────────── CYCLE 1 (Turns 1–9) ───────────────────
 
 Turn 1 → Member 01:
-  _on_turn([1, 1])
+  _on_take_turn(1)                     ← called locally by start_relay()
     set _busy = True, publish DRAWING
     execute_turn(1)
       prepare_turn(1) → set_pen(off=True)          ← lifts pen
@@ -679,22 +703,22 @@ Turn 1 → Member 01:
               set_pen(off=True)                     ← lifts pen
               ... repeat for each stroke
             _finish() → Future resolves
-  _after_turn() → publish [2, 2]
+  _after_turn() → call member_02 take_turn(2)
 
 Turn 2 → Member 02:
   (same pattern as Turn 1, Member 02 draws glyph '2')
-  _after_turn() → publish [3, 3]
+  _after_turn() → call member_03 take_turn(3)
 
 ...
 
 Turn 9 → Member 09:
   (draws glyph '9')
-  _after_turn() → publish [10, 1]
+  _after_turn() → call member_01 take_turn(10)
 
 ─────────────────── CYCLE 2 (Turns 10–18) ──────────────────
 
 Turn 10 → Member 01:
-  _on_turn([10, 1])
+  _on_take_turn(10)                   ← called by Member 09's handoff
     execute_turn(10)
       prepare_turn(10):
         call /clear → canvas wiped
@@ -702,7 +726,7 @@ Turn 10 → Member 01:
       draw_digit(10, slot_01)
         glyph = '10', strokes = GLYPH_10_STROKES
         _draw_configured_glyph() → draws "10" in slot 1
-  _after_turn() → publish [11, 2]
+  _after_turn() → call member_02 take_turn(11)
 
 Turn 11 → Member 02: draws '11'
 Turn 12 → Member 03: draws '12'
@@ -710,7 +734,7 @@ Turn 12 → Member 03: draws '12'
 Turn 17 → Member 08: draws '17'
 
 Turn 18 → Member 09:
-  _on_turn([18, 9])
+  _on_take_turn(18)                   ← called by Member 08's handoff
     execute_turn(18) → draws '18'
   _after_turn():
     18 == 2 * 9 → final turn
@@ -735,30 +759,26 @@ Every member node runs this implicit state machine:
          ─────────────── ▼                              │
         │           [WAITING_FOR_TURN]                  │
         │                │                              │
-        │         token received                        │
+        │      take_turn service called                 │
         │                ▼                              │
-        │       active_member == self?                  │
+        │        _busy or invalid turn?                 │
         │           /         \                         │
-        │         No           Yes                      │
+        │         Yes           No                      │
         │          │            │                       │
-        │          ▼            ▼                       │
-        │   [WAITING_FOR      _busy or already done?    │
-        │    MEMBER_NN]       /              \          │
-        │                   Yes              No         │
-        │                    │               │          │
-        │               (ignore)        [DRAWING]       │
-        │                                   │           │
-        │                              success?         │
-        │                            /        \         │
-        │                          No          Yes      │
-        │                           │            │      │
-        │                       [ERROR]    final turn?  │
-        │                                  /       \    │
-        │                                Yes        No  │
-        │                                 │          │  │
-        │                          [COMPLETE]   publish │
-        │                          shutdown     next    │
-        └───────────────────────────────  token ───────-┘
+        │     (reject call) [DRAWING]                   │
+        │                           │                   │
+        │                      success?                │
+        │                    /        \                 │
+        │                  No          Yes              │
+        │                   │            │              │
+        │               [ERROR]    final turn?          │
+        │                          /       \            │
+        │                        Yes        No          │
+        │                         │          │          │
+        │                  [COMPLETE]   call next       │
+        │                  shutdown   member's          │
+        │                           take_turn ──────────┘
+        └──────────────────────────────┘
 ```
 
 ---
@@ -868,9 +888,9 @@ This wraps correctly: after turn 9 (Member 09), next is turn 10 assigned to Memb
 |---|---|
 | Service call fails | Future resolves with exception. `_after_turn()` catches it, publishes `ERROR`, calls `_fail_turn()` which clears `_busy`. The turn token is **not passed**; the relay stalls. |
 | Drawing motion fails | Same as above—`_DigitDrawingJob._fail()` rejects the Future. |
-| Malformed turn token (fewer than 2 integers) | `_on_turn()` logs an error and returns. Token ignored. |
-| Duplicate turn token (same number received twice) | `current_number ≤ _last_completed_number` guard prevents re-execution. |
-| `_busy` is `True` when token arrives | Token silently dropped. Prevents concurrent drawing if a token is somehow re-received. |
+| `take_turn` called with a turn this member does not own | Service replies `accepted=False` with an explanation; the caller logs an error. |
+| Duplicate turn token (same number received twice) | `current_number ≤ _last_completed_number` guard rejects the call with `accepted=False`. |
+| `_busy` is `True` when `take_turn` arrives | Service replies `accepted=False`. Prevents concurrent drawing if a token is somehow re-received. |
 | Pose not yet available when drawing starts | `_tick()` logs a single warning and waits. Drawing starts as soon as pose arrives. |
 | `/turtle1/cmd_vel` has no subscriber (turtlesim not ready) | `_tick()` logs a single warning and waits. |
 | `KeyboardInterrupt` during spin | `run_member()` catches it in the `finally` block, destroys the node cleanly, and calls `rclpy.shutdown()` if still active. |
@@ -886,9 +906,9 @@ source /opt/ros/jazzy/setup.bash
 cd /path/to/ros2_ws
 
 # Remove stale build artifacts (important after adding/renaming members)
-rm -rf build/digit_relay install/digit_relay
+rm -rf build/digit_relay build/digit_relay_interfaces install/digit_relay install/digit_relay_interfaces
 
-colcon build --packages-select digit_relay
+colcon build --packages-select digit_relay_interfaces digit_relay
 source install/setup.bash
 ```
 
@@ -922,11 +942,14 @@ cd /path/to/ros2_ws
 source install/setup.bash
 ```
 
-### Watch the turn token flow
+### Watch the turn handoffs
 
 ```bash
-ros2 topic echo /digit_relay/turn
-# Each message shows: data: [current_number, active_member]
+ros2 service list | grep take_turn
+# Shows /digit_relay/member_01/take_turn through .../member_09/take_turn
+
+ros2 interface show digit_relay_interfaces/srv/TakeTurn
+# Shows the request (current_number) and response (accepted, message)
 ```
 
 ### Watch all member statuses
@@ -943,14 +966,14 @@ ros2 node list
 # Should show: /digit_relay_member_01 through /digit_relay_member_09 + /turtlesim
 ```
 
-### Inspect topic details
+### Inspect service details
 
 ```bash
-ros2 topic info /digit_relay/turn --verbose
-# Shows QoS settings and publisher/subscriber counts (should be 9+9)
+ros2 service type /digit_relay/member_01/take_turn
+# digit_relay_interfaces/srv/TakeTurn
 
 ros2 service list
-# Should show /turtle1/set_pen, /clear, etc.
+# Should show /digit_relay/member_NN/take_turn, /turtle1/set_pen, /clear, etc.
 ```
 
 ### Check single member logs
@@ -966,7 +989,7 @@ file). You can filter for a specific member:
 
 | Symptom | Likely cause |
 |---|---|
-| Relay never starts (hangs at "Waiting until all 9...") | Not all 9 members are running or subscribed. Check `ros2 node list`. |
+| Relay never starts (hangs at "Waiting until all 9...") | Not all 9 members are running or their `take_turn` services are not discoverable. Check `ros2 node list` and `ros2 service list | grep take_turn`. |
 | Turtle moves erratically | Multiple members publishing to `/cmd_vel` simultaneously (shouldn't happen in correct implementation). |
 | Turn stalls after a certain number | A member's `prepare_turn()` or `draw_digit()` Future never resolved (service unavailable or exception caught and swallowed). Check console for `ERROR` state. |
 | Canvas not cleared between cycles | Member 01's `/clear` client could not reach the service. Check turtlesim is running. |

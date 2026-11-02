@@ -1,0 +1,7 @@
+# Hand the relay token to the member that owns this service.
+int32 current_number
+---
+# True when the member accepted the token and started its turn.
+bool accepted
+# Human-readable explanation for a rejection or acceptance.
+string message

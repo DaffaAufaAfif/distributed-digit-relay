@@ -52,6 +52,7 @@ class DigitDrawingMember(DigitRelayNode):
         super().__init__(
             member_id=member_id,
             total_members=total_members,
+            valid_turn_numbers=valid_turn_numbers,
         )
         self.pen_color = pen_color
         self.glyph = glyph
