@@ -1,4 +1,4 @@
-"""Member 02: draw glyph 2 on its configured turns in cycle one and cycle two."""
+"""Member 02: Shabrina Sarayati (5054241009)"""
 
 from concurrent.futures import Future
 
