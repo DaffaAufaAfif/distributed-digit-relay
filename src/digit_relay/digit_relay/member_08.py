@@ -1,4 +1,4 @@
-"""Member 08: draw glyph 8 on turn 8 and glyph 17 on turn 17."""
+"""Member 08 (Vincent Valentino): 8 & 17."""
 
 from concurrent.futures import Future
 
